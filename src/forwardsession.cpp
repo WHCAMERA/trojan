@@ -36,8 +36,13 @@ tcp::socket& ForwardSession::accept_socket() {
 }
 
 void ForwardSession::start() {
+    boost::system::error_code ec;
     start_time = time(NULL);
-    in_endpoint = in_socket.remote_endpoint();
+    in_endpoint = in_socket.remote_endpoint(ec);
+    if (ec) {
+        destroy();
+        return;
+    }
     auto ssl = out_socket.native_handle();
     if (config.ssl.sni != "") {
         SSL_set_tlsext_host_name(ssl, config.ssl.sni.c_str());
@@ -63,7 +68,12 @@ void ForwardSession::start() {
             destroy();
             return;
         }
-        out_socket.lowest_layer().open(iterator->endpoint().protocol());
+        boost::system::error_code ec;
+        out_socket.lowest_layer().open(iterator->endpoint().protocol(), ec);
+        if (ec) {
+            destroy();
+            return;
+        }
         if (config.tcp.no_delay) {
             out_socket.lowest_layer().set_option(tcp::no_delay(true));
         }
@@ -199,11 +209,11 @@ void ForwardSession::destroy() {
     }
     if (out_socket.lowest_layer().is_open()) {
         out_socket.lowest_layer().cancel(ec);
-        auto self = shared_from_this();
-        out_socket.async_shutdown([this, self](const boost::system::error_code) {
-            boost::system::error_code ec;
-            out_socket.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
-            out_socket.lowest_layer().close(ec);
-        });
+        // only do unidirectional shutdown and don't wait for other side's close_notify
+        // a.k.a. call SSL_shutdown() once and discard its return value
+        ::SSL_set_shutdown(out_socket.native_handle(), SSL_RECEIVED_SHUTDOWN);
+        out_socket.shutdown(ec);
+        out_socket.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
+        out_socket.lowest_layer().close(ec);
     }
 }

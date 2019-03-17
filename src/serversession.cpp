@@ -38,8 +38,13 @@ tcp::socket& ServerSession::accept_socket() {
 }
 
 void ServerSession::start() {
+    boost::system::error_code ec;
     start_time = time(NULL);
-    in_endpoint = in_socket.lowest_layer().remote_endpoint();
+    in_endpoint = in_socket.lowest_layer().remote_endpoint(ec);
+    if (ec) {
+        destroy();
+        return;
+    }
     auto self = shared_from_this();
     in_socket.async_handshake(stream_base::server, [this, self](const boost::system::error_code error) {
         if (error) {
@@ -175,7 +180,12 @@ void ServerSession::in_recv(const string &data) {
                     }
                 }
             }
-            out_socket.open(iterator->endpoint().protocol());
+            boost::system::error_code ec;
+            out_socket.open(iterator->endpoint().protocol(), ec);
+            if (ec) {
+                destroy();
+                return;
+            }
             if (config.tcp.no_delay) {
                 out_socket.set_option(tcp::no_delay(true));
             }
@@ -278,7 +288,12 @@ void ServerSession::udp_sent() {
             }
             if (!udp_socket.is_open()) {
                 auto protocol = iterator->endpoint().protocol();
-                udp_socket.open(protocol);
+                boost::system::error_code ec;
+                udp_socket.open(protocol, ec);
+                if (ec) {
+                    destroy();
+                    return;
+                }
                 udp_socket.bind(udp::endpoint(protocol, 0));
                 udp_async_read();
             }
@@ -311,11 +326,11 @@ void ServerSession::destroy() {
     }
     if (in_socket.lowest_layer().is_open()) {
         in_socket.lowest_layer().cancel(ec);
-        auto self = shared_from_this();
-        in_socket.async_shutdown([this, self](const boost::system::error_code) {
-            boost::system::error_code ec;
-            in_socket.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
-            in_socket.lowest_layer().close(ec);
-        });
+        // only do unidirectional shutdown and don't wait for other side's close_notify
+        // a.k.a. call SSL_shutdown() once and discard its return value
+        ::SSL_set_shutdown(in_socket.native_handle(), SSL_RECEIVED_SHUTDOWN);
+        in_socket.shutdown(ec);
+        in_socket.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
+        in_socket.lowest_layer().close(ec);
     }
 }

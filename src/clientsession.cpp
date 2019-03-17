@@ -37,8 +37,13 @@ tcp::socket& ClientSession::accept_socket() {
 }
 
 void ClientSession::start() {
+    boost::system::error_code ec;
     start_time = time(NULL);
-    in_endpoint = in_socket.remote_endpoint();
+    in_endpoint = in_socket.remote_endpoint(ec);
+    if (ec) {
+        destroy();
+        return;
+    }
     auto ssl = out_socket.native_handle();
     if (config.ssl.sni != "") {
         SSL_set_tlsext_host_name(ssl, config.ssl.sni.c_str());
@@ -159,7 +164,12 @@ void ClientSession::in_recv(const string &data) {
             is_udp = req.command == TrojanRequest::UDP_ASSOCIATE;
             if (is_udp) {
                 udp::endpoint bindpoint(in_socket.local_endpoint().address(), 0);
-                udp_socket.open(bindpoint.protocol());
+                boost::system::error_code ec;
+                udp_socket.open(bindpoint.protocol(), ec);
+                if (ec) {
+                    destroy();
+                    return;
+                }
                 udp_socket.bind(bindpoint);
                 Log::log_with_endpoint(in_endpoint, "requested UDP associate to " + req.address.address + ':' + to_string(req.address.port) + ", open UDP socket " + udp_socket.local_endpoint().address().to_string() + ':' + to_string(udp_socket.local_endpoint().port()) + " for relay", Log::INFO);
                 in_async_write(string("\x05\x00\x00", 3) + SOCKS5Address::generate(udp_socket.local_endpoint()));
@@ -218,7 +228,12 @@ void ClientSession::in_sent() {
                     destroy();
                     return;
                 }
-                out_socket.lowest_layer().open(iterator->endpoint().protocol());
+                boost::system::error_code ec;
+                out_socket.lowest_layer().open(iterator->endpoint().protocol(), ec);
+                if (ec) {
+                    destroy();
+                    return;
+                }
                 if (config.tcp.no_delay) {
                     out_socket.lowest_layer().set_option(tcp::no_delay(true));
                 }
@@ -372,11 +387,11 @@ void ClientSession::destroy() {
     }
     if (out_socket.lowest_layer().is_open()) {
         out_socket.lowest_layer().cancel(ec);
-        auto self = shared_from_this();
-        out_socket.async_shutdown([this, self](const boost::system::error_code) {
-            boost::system::error_code ec;
-            out_socket.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
-            out_socket.lowest_layer().close(ec);
-        });
+        // only do unidirectional shutdown and don't wait for other side's close_notify
+        // a.k.a. call SSL_shutdown() once and discard its return value
+        ::SSL_set_shutdown(out_socket.native_handle(), SSL_RECEIVED_SHUTDOWN);
+        out_socket.shutdown(ec);
+        out_socket.lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
+        out_socket.lowest_layer().close(ec);
     }
 }
